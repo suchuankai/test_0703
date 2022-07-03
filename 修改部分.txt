@@ -1,0 +1,454 @@
+1. SA.scala
+
+
+新增一個master port ， 原本local memory的部分註解掉
+val master = new AXILiteMasterIF(addr_width, data_width)
+
+加上初始化值
+
+
+2. Memory_mapped.scala
+
+一樣把local memory 的部分註解掉
+
+
+3. topSA.scala
+加上一個master port
+
+
+
+package aias_lab9.SystolicArray
+
+import chisel3._
+import chisel3.util._
+
+import scala.io.Source
+
+import aias_lab9.AXILite._
+
+class SA(rows:Int,
+         cols:Int,
+         addr_width:Int,
+         data_width:Int,
+         reg_width:Int) extends Module{
+    val io = IO(new Bundle{
+        // for the connection to mmio
+        val mmio = Flipped(new MMIO(reg_width))
+        
+        // local memory 部份註解掉
+        // for access localmem when SA still be a slave         
+        // val raddr = Output(UInt(addr_width.W))
+        // val rdata = Input(UInt(data_width.W))
+        
+        // val wen   = Output(Bool())
+        // val waddr = Output(UInt(addr_width.W))
+        // val wdata = Output(UInt(data_width.W))
+        // val wstrb = Output(UInt((data_width>>3).W))
+        
+        val master = new AXILiteMasterIF(addr_width, data_width)    //用master取代上面
+
+        // for making localMem print the value
+        val finish = Output(Bool())
+    })
+
+
+    //初始化 master的部分
+    io.master.writeAddr.bits.addr := 0.U
+    io.master.readData.ready := false.B
+    io.master.writeData.valid := false.B
+    io.master.writeAddr.valid := false.B
+    io.master.readAddr.bits.addr := 0.U
+    io.master.writeResp.ready := false.B
+    io.master.writeData.bits.data := 0.U
+    io.master.readAddr.valid := false.B
+    io.master.writeData.bits.strb := 0.U   
+
+    
+
+    // constant declaration    (amend nothing)
+    val byte = 8
+    val mat_a_rows = io.mmio.MATA_SIZE(11, 0) + 1.U
+    val mat_a_cols = io.mmio.MATA_SIZE(27,16) + 1.U
+    val mat_b_rows = io.mmio.MATB_SIZE(11, 0) + 1.U
+    val mat_b_cols = io.mmio.MATB_SIZE(27,16) + 1.U
+    val mat_c_rows = io.mmio.MATC_SIZE(11, 0) + 1.U
+    val mat_c_cols = io.mmio.MATC_SIZE(27,16) + 1.U        
+
+    // Module Declaration  (amend nothing)
+    val i_buffer = Module(new buffer(rows,byte))
+    val o_buffer = Module(new buffer(cols,byte))
+    val tile = Module(new tile(rows,cols,byte))
+
+
+
+
+
+
+
+
+
+
+    //counter declaration
+    val w_cnt = RegInit(0.U(4.W))      //used for "weight" data access 
+    val i_cnt = RegInit(0.U(4.W))      //used for "input" data access 
+    val o_cnt = RegInit(0.U(4.W))      //used for "input" data access 
+    val read_cnt  = RegInit(0.U(4.W))  //input counter
+    val write_cnt = RegInit(0.U(4.W))  //write counter
+    // Enable Register
+    val ENABLE_REG = RegInit(false.B)
+
+
+    // Read Memory Wiring   (amend nothing)
+    val mat_buf = 0x000000 // 0 because the localMem is still local for SA 
+    val a_base_addr = WireDefault(io.mmio.MATA_MEM_ADDR)
+    val b_base_addr = WireDefault(io.mmio.MATB_MEM_ADDR)
+    val c_base_addr = WireDefault(io.mmio.MATC_MEM_ADDR)
+
+    // AXI Bus FSM================================================================
+    // 與vector cpu設計相同
+    val sNormal :: sAXIReadSend :: sAXIReadWait :: sAXIWriteSend :: sAXIWriteWait :: Nil = Enum(5)
+    val DataMemAccessState = RegInit(sNormal)
+    // AXI Bus================================================================
+
+
+    //FSM
+    val sIdle :: sReady :: sFetch_preload :: sStall_0 :: sPreload :: sFetch_propagate :: sStall_1 :: sPropagate :: sCheck :: sStall_2:: sWrite_output :: sStall_3::sWrite_check::sFinish :: Nil = Enum(14)
+    //val sIdle :: sReady  :: sStall_0 :: sPreload :: sStall_1 ::  sPropagate :: sCheck :: sFinish :: Nil = Enum(8)
+    val state = RegInit(sIdle)
+
+    //與vector cpu設計相同
+    switch(DataMemAccessState) {
+        is(sNormal) {
+            when(isDataLoad) {
+                DataMemAccessState := Mux(io.master.readAddr.ready, sAXIReadWait, sAXIReadSend)
+            }.elsewhen(isDataStore) {
+                DataMemAccessState := Mux((io.master.writeAddr.ready & io.master.writeData.ready), sAXIWriteWait, sAXIWriteSend)
+            }.otherwise {
+                DataMemAccessState := sNormal
+            }
+
+            io.master.readAddr.valid  := isDataLoad
+            io.master.writeAddr.valid := (isDataStore & io.master.writeAddr.ready & io.master.writeData.ready)
+            io.master.writeData.valid := (isDataStore & io.master.writeAddr.ready & io.master.writeData.ready)
+        }
+        is(sAXIReadSend) {//waiting for slave's readAddr.ready
+            DataMemAccessState := Mux(io.master.readAddr.ready, sAXIReadWait, sAXIReadSend)
+            
+            //io.master.readAddr.valid := true.B
+            io.readAddr.valid := Mux(io.master.readAddr.ready, true.B, false.B)
+        }
+        is(sAXIReadWait) {//address send 
+            DataMemAccessState := Mux(io.master.readData.valid, sNormal, sAXIReadWait)
+            when(io.master.readData.valid){
+                read_cnt := Mux(read_cnt === 2.U, 0.U, read_cnt + 1.U)
+            }
+            
+            io.master.readData.ready := true.B
+        }
+        is(sAXIWriteSend) {
+            DataMemAccessState := Mux((io.master.writeAddr.ready & io.master.writeData.ready), sAXIWriteWait, sAXIWriteSend)
+        
+            io.master.writeAddr.valid := (isDataStore & io.master.writeAddr.ready & io.master.writeData.ready)
+            io.master.writeData.valid := (isDataStore & io.master.writeAddr.ready & io.master.writeData.ready)
+        }
+        is(sAXIWriteWait) {
+            DataMemAccessState := Mux(io.master.writeResp.valid, sNormal, sAXIWriteWait)
+        
+            io.master.writeResp.ready := true.B
+        }
+    }
+
+
+    //最多讀64bit，所以要分次讀
+    when(state === sFetch_preload && io.master.readData.valid){
+        switch(read_cnt){   //matrix weight(A)
+            is(0.U){
+                array(0) := io.master.readData.bits.data(7,  0)
+                array(1) := io.master.readData.bits.data(15, 8)
+                array(2) := io.master.readData.bits.data(23,16)
+                array(3) := io.master.readData.bits.data(31,24)
+                array(4) := io.master.readData.bits.data(39,32)
+                array(5) := io.master.readData.bits.data(47,40)
+                array(6) := io.master.readData.bits.data(55,48)
+                array(7) := io.master.readData.bits.data(63,56)
+            }
+            is(1.U){
+                array(8)  := io.master.readData.bits.data(7,  0)
+                array(9)  := io.master.readData.bits.data(15, 8)
+                array(10) := io.master.readData.bits.data(23,16)
+                array(11) := io.master.readData.bits.data(31,24) 
+                array(12) := io.master.readData.bits.data(39,32)
+                array(13) := io.master.readData.bits.data(47,40)
+                array(14) := io.master.readData.bits.data(55,48)
+                array(15) := io.master.readData.bits.data(63,56)
+            }
+        }
+    }
+    .elsewhen(state === sFetch_propagate && io.master.readData.valid){
+        switch(read_cnt){   //matrix input(B)
+            is(0.U){
+                array(0) := io.master.readData.bits.data(7,  0)
+                array(1) := io.master.readData.bits.data(15, 8)
+                array(2) := io.master.readData.bits.data(23,16)
+                array(3) := io.master.readData.bits.data(31,24)
+                array(4) := io.master.readData.bits.data(39,32)
+                array(5) := io.master.readData.bits.data(47,40)
+                array(6) := io.master.readData.bits.data(55,48)
+                array(7) := io.master.readData.bits.data(63,56)
+            }
+            is(1.U){
+                array(8)  := io.master.readData.bits.data(7,  0)
+                array(9)  := io.master.readData.bits.data(15, 8)
+                array(10) := io.master.readData.bits.data(23,16)
+                array(11) := io.master.readData.bits.data(31,24)
+                array(12) := io.master.readData.bits.data(39,32)
+                array(13) := io.master.readData.bits.data(47,40)
+                array(14) := io.master.readData.bits.data(55,48)
+                array(15) := io.master.readData.bits.data(63,56)
+            }
+        }
+    }
+    .elsewhen(state === sCheck){
+        switch(o_cnt){
+            is(0.U){
+                array(0) := word_wdata(7,  0)
+                array(1) := word_wdata(15, 8)
+                array(2) := word_wdata(23,16)
+                array(3) := word_wdata(31,24)
+            }
+            is(1.U){
+                array(4) := word_wdata(7,  0)
+                array(5) := word_wdata(15, 8)
+                array(6) := word_wdata(23,16)
+                array(7) := word_wdata(31,24)
+            }
+            is(2.U){
+                array(8)  := word_wdata(7,  0)
+                array(9)  := word_wdata(15, 8)
+                array(10) := word_wdata(23,16)
+                array(11) := word_wdata(31,24)
+            }
+            is(3.U){
+                array(12) := word_wdata(7,  0)
+                array(13) := word_wdata(15, 8)
+                array(14) := word_wdata(23,16)
+                array(15) := word_wdata(31,24)
+            }
+        }
+    }
+
+   
+
+
+    
+    
+
+    //這邊會決定master讀到哪個位址，送過去給array
+    when(state===sReady){
+        io.master.readAddr.bits.addr := 0.U
+    }
+    .elsewhen(state===sFetch_preload){
+        io.master.readAddr.bits.addr := b_base_addr + (read_cnt << 3)
+    }
+    .elsewhen(state===sPreload){
+        io.master.readAddr.bits.addr := 0.U
+    }
+    .elsewhen(state===sFetch_propagate){
+        io.master.readAddr.bits.addr := a_base_addr + (read_cnt << 3)
+    }
+    .elsewhen(state===sStall_1){
+        io.master.readAddr.bits.addr := a_base_addr + (i_cnt << 2)
+    }
+    .elsewhen(state===sPropagate){
+        io.master.readAddr.bits.addr := a_base_addr + (i_cnt << 2)
+    }
+    .elsewhen(state===sCheck){
+        io.master.readAddr.bits.addr := c_base_addr + (o_cnt << 2)
+    }
+    .otherwise{
+        io.master.readAddr.bits.addr := 0.U
+    }
+
+    //val rdata_picker = RegNext(io.raddr)
+    //val rdata = Mux(rdata_picker(2) === 0.U,io.rdata(63,32),io.rdata(31,0))
+    val rdata = Wire(UInt(32.W))
+    rdata := 0.U
+    when(state === sPreload){
+        switch(w_cnt){
+            is(1.U){
+                rdata := Cat(array(0), array(1),array(2),array(3))
+            }
+            is(2.U){
+                rdata := Cat(array(4), array(5),array(6),array(7))
+            }
+            is(3.U){
+                rdata := Cat(array(8), array(9),array(10),array(11))
+            }
+            is(4.U){
+                rdata := Cat(array(12), array(13),array(14),array(15))
+            }
+        }
+    }
+    .elsewhen(state === sPropagate){
+        switch(i_cnt){
+            is(1.U){
+                rdata := Cat(array(0), array(1),array(2),array(3))
+            }
+            is(2.U){
+                rdata := Cat(array(4), array(5),array(6),array(7))
+            }
+            is(3.U){
+                rdata := Cat(array(8), array(9),array(10),array(11))
+            }
+            is(4.U){
+                rdata := Cat(array(12), array(13),array(14),array(15))
+            }
+        }
+    }
+
+    when(state === sWrite_output){
+        switch(write_cnt){
+            is(0.U){
+                io.master.writeData.bits.data := Cat(array(0), array(1), array(2), array(3),array(4),array(5),array(6),array(7))
+                io.master.writeAddr.bits.addr := c_base_addr 
+            }
+            is(1.U){
+                io.master.writeData.bits.data := Cat(array(8), array(9), array(10), array(11),array(12),array(13),array(14),array(15))
+                io.master.writeAddr.bits.addr := c_base_addr + 8.U
+            }
+        }
+        
+    }
+
+    //io.waddr := c_base_addr + (o_cnt<<2)
+    // 存到 tile 
+    val word_wdata = WireDefault(List.range(0,cols).map{case x => o_buffer.io.output(x).bits <<(byte*(cols-1-x))}.reduce(_+_))
+    //io.wdata := Mux(o_cnt(0)===0.U,Cat(0.U(32.W),word_wdata),Cat(word_wdata,0.U(32.W)))
+    //io.wstrb := Mux(o_cnt(0)===0.U,"b00001111".U,"b11110000".U)
+    //io.wen := o_buffer.io.output(0).valid
+
+
+
+    // tile 2 Output Buffer wiring (amend nothing)
+    List.range(0,cols).map{x=>
+        o_buffer.io.input(cols-1-x) <> tile.io.output(x)
+    }
+    io.finish := io.mmio.STATUS_IN
+    //input buffer 2 tile wiring
+    tile.io.input <> i_buffer.io.output
+    //In our design, the preload of weight doesn't pass through the buffer
+    List.range(0,cols).map{x=>
+        tile.io.weight(x).bits := Mux(state===sPreload,rdata((cols-x)*byte-1,(cols-x-1)*byte),0.U)
+        tile.io.weight(x).valid := state===sPreload
+    }
+    tile.io.preload := state === sPreload
+    //mem to input buffer wiring
+    List.range(0,rows).map{x=>
+        i_buffer.io.input(x).bits := Mux(
+            state === sPropagate && i_cnt <= cols.U , 
+            rdata(byte*(x+1)-1,byte*x),
+            0.U 
+        )
+        i_buffer.io.input(x).valid := Mux(
+            state === sPropagate && i_cnt <= cols.U , 
+            true.B, 
+            false.B
+        )
+    }
+    //----------------------------------------------
+
+    when(state===sIdle){    //等待觸發信號
+        state := sReady
+    }
+    .elsewhen(state===sReady){
+        state := Mux(io.mmio.ENABLE_OUT,sFetch_preload,sReady)
+        ENABLE_REG := io.mmio.ENABLE_OUT
+        read_cnt := 0.U   // add
+    }
+    .elsewhen(state === sFetch_preload){
+        when(io.mmio.ENABLE_OUT){
+            state := Mux(read_cnt === 2.U, sStall_0, sFetch_preload)
+            
+        }.otherwise{
+            state := sReady
+            w_cnt := 0.U
+        }
+    }
+    .elsewhen(state===sStall_0){
+        state := sPreload
+        w_cnt := w_cnt + 1.U
+    }
+    .elsewhen(state===sPreload){   //將所有weight preload到PE裡面
+        when(io.mmio.ENABLE_OUT){
+            state := Mux(w_cnt === rows.U, sFetch_propagate, sPreload)
+            w_cnt := Mux(w_cnt === rows.U, 0.U, w_cnt + 1.U)
+            read_cnt === 0.U
+        }.otherwise{
+            state := sReady
+            w_cnt := 0.U
+        }
+    }
+    .elsewhen(state===sFetch_propagate){
+        when(io.mmio.ENABLE_OUT){
+            state := Mux(read_cnt === 2.U, sStall_1, sFetch_propagate)
+        }.otherwise{
+            state := sReady
+            w_cnt := 0.U
+        }
+    }
+    .elsewhen(state===sStall_1){
+        state := sPropagate
+        i_cnt := i_cnt + 1.U
+    }
+    .elsewhen(state===sPropagate){  //每個cycle傳入a row of input matrix
+        when(io.mmio.ENABLE_OUT){
+            state := Mux(i_cnt===(cols+rows-1).U, sCheck, sPropagate)
+            i_cnt := i_cnt + Mux(i_cnt===(cols+rows-1).U, 0.U, 1.U)
+        }.otherwise{
+            state := sReady
+            i_cnt := 0.U
+        }
+    }
+    .elsewhen(state===sCheck){
+        state := Mux(o_cnt===(rows-1).U, sFinish, sCheck)
+        o_cnt := Mux(o_cnt===(rows-1).U, 0.U, o_cnt + 1.U)
+        ENABLE_REG := Mux(o_cnt===(rows-1).U, false.B, ENABLE_REG)
+    }
+    .elsewhen(state===sStall_2){
+        state := sWrite_output
+        write_cnt := 0.U
+    }
+    .elsewhen(state===sWrite_output){
+        state := Mux(write_cnt===2.U, sStall_3, sWrite_output)
+        // write_cnt := Mux(write_cnt === 2.U, 0.U, write_cnt + 1.U)
+    }
+    .elsewhen(state===sStall_3){
+        state := sWrite_check
+        read_cnt := 0.U
+    }
+    .elsewhen(state === sWrite_check){
+        state := Mux(read_cnt === 2.U, sFinish, sWrite_check)
+    }
+    .elsewhen(state===sFinish){
+        state := sIdle
+    }
+
+    io.mmio.WEN := state===sFinish
+    io.mmio.STATUS_IN := state===sFinish
+    io.mmio.ENABLE_IN := ENABLE_REG
+    // state := Mux(!io.mmio.ENABLE,sReady,sPreload)
+    
+    
+    
+//     //--------------------------------------------------------------------
+//     io.c_rdata := c_rdata
+
+}
+
+object SA extends App{
+    (new chisel3.stage.ChiselStage).emitVerilog(
+        new SA(4,4,32,64,32),
+        Array("-td","./generated/SA")
+    )
+}
+ 
